@@ -43,4 +43,8 @@ rosrun transnet_ros camera_calibrator.py
 
 ### TransNet Object Pose Estimation
 
-TODO: complete this after merging mask-rcnn detection with transnet pose estimation
+Specify `--category` to focus on one object category, `--maskrcnn_weight_path, --transnet_weight_path` as path to pretrained models, `--user_save_channel` to save current frame output to file and keep publishing to `--output_pose_channel`. visualization will publish to `--output_vis_channel`, see scripts/transnet_pose_estimator.py for more details
+
+```
+rosrun transnet_ros transnet_pose_estimator.py
+```

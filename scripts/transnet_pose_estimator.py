@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 import torch
+import torchvision.transforms.functional as F
 import threading
 import cv2
 import argparse
@@ -16,6 +17,7 @@ transnet_src_path = os.path.dirname(os.path.realpath(__file__)) + '/../src'
 if transnet_src_path not in sys.path:
     sys.path.append(transnet_src_path)
 
+from TransNet.network_utility.segmentation.mask_rcnn import build_model
 from TransNet.config.config import *
 from TransNet.data.dataset import PoseEstimationDataset as PoseDataset
 from TransNet.network_utility.network import TransNet
@@ -36,12 +38,21 @@ class TransNet_Pose_Estimator():
         rospy.init_node(args.node_name)
 
         self.args = args
+        
+        self.maskrcnn_model = build_model(config={'num_classes': 7})
+        self.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+        self.state_dict = torch.load(args.maskrcnn_weight_path, map_location=self.device)
+        self.maskrcnn_model.load_state_dict(self.state_dict['model_state_dict'])
+        self.maskrcnn_model.to(self.device)
+        self.maskrcnn_model.eval()
+
+        rospy.loginfo('Mask R-CNN Network loaded')
 
         self.transnet_model = TransNet().to(args.device)
         self.transnet_model = self.transnet_model.eval()
         state_dict = torch.load(args.transnet_weight_path)
         self.transnet_model.posenet.load_state_dict(state_dict['posenet_state_dict'])
-        rospy.loginfo('Finish initializing TransNet')
+        rospy.loginfo('TransNet Network loaded')
         self.dataset = PoseDataset(dataset_name="train", args=args, root=args.dataset_dir)
         self.output = None
         self.vis_img = None
@@ -68,10 +79,10 @@ class TransNet_Pose_Estimator():
 
         # self.meta_sub = rospy.Subscriber(args.input_meta_channel, Float32MultiArray, self.maskrcnn_meta_callback)
         # self.mask_sub = rospy.Subscriber(args.input_mask_channel, Float32MultiArray, self.maskrcnn_mask_callback)
-        meta_sub = Subscriber(args.input_meta_channel, Float32MultiArray)
-        mask_sub = Subscriber(args.input_mask_channel, Float32MultiArray)
-        ts1 = ApproximateTimeSynchronizer([meta_sub, mask_sub], 10, 0.5, allow_headerless=True)
-        ts1.registerCallback(self.maskrcnn_meta_mask_callback)
+        # meta_sub = Subscriber(args.input_meta_channel, Float32MultiArray)
+        # mask_sub = Subscriber(args.input_mask_channel, Float32MultiArray)
+        # ts1 = ApproximateTimeSynchronizer([meta_sub, mask_sub], 10, 0.5, allow_headerless=True)
+        # ts1.registerCallback(self.maskrcnn_meta_mask_callback)
 
         # self.calib_sub = rospy.Subscriber(args.cam2robot_calib_channel, PoseStamped, self.register_calib_callback, queue_size=1)
 
@@ -85,6 +96,26 @@ class TransNet_Pose_Estimator():
         else: # will only run when activated
             rospy.loginfo(f'Waiting activation from {args.user_activate_channel} to run inference')
             self.run_net_sub = rospy.Subscriber(args.user_activate_channel, Bool, self.inference, queue_size=1)
+
+        self.category = {
+            'bottle': 1,
+            'bowl': 2,
+            'container': 3,
+            'tableware': 4,
+            'water_cup': 5,
+            'wine_cup': 6            
+        }
+        self.category_inverse = [
+            'background',
+            'bottle',
+            'bowl',
+            'container',
+            'tableware',
+            'water_cup',
+            'wine_cup'
+        ]
+        if args.category not in self.category:
+            rospy.logwarn('incorrect args.category, should be within %s', self.category.keys())
     
     def crop_img(self):
         with self._lock: # TODO: only work for 720*1280 input
@@ -106,33 +137,7 @@ class TransNet_Pose_Estimator():
             self._depth_image = ros_numpy.numpify(depth).astype(np.float64) / self.depth_unit
             if self._rgb_image.shape[0] != 480:
                 self.crop_img()
-    
-    def maskrcnn_meta_callback(self, metas):
-        with self._lock:
-            # metas: [N, 6] -> labels, scores, boxes
-            metas = np.array(metas.data).reshape(-1, 6)
-            labels, scores, boxes = metas[:, 0].astype(np.uint16), metas[:, 1], metas[:, 2:]
-            self.maskrcnn_output[0] = labels
-            self.maskrcnn_output[1] = scores
-            self.maskrcnn_output[2] = boxes
-    
-    def maskrcnn_mask_callback(self, masks):
-        with self._lock:
-            masks = np.array(masks.data).reshape(-1, 480, 640) # TODO: add image resolution to config
-            self.maskrcnn_output[3] = masks
-
-    def maskrcnn_meta_mask_callback(self, metas, masks):
-        with self._lock:
-            # metas: [N, 6] -> labels, scores, boxes
-            metas = np.array(metas.data).reshape(-1, 6)
-            labels, scores, boxes = metas[:, 0].astype(np.uint16), metas[:, 1], metas[:, 2:]
-            self.maskrcnn_output[0] = labels
-            self.maskrcnn_output[1] = scores
-            self.maskrcnn_output[2] = boxes
-            
-            masks = np.array(masks.data).reshape(-1, 480, 640) # TODO: add image resolution to config
-            self.maskrcnn_output[3] = masks
-    
+ 
     def register_calib_callback(self, msg):
         # receive transformation from camera to robot's chest (added transform to have z upward, x forward in robot world), then fit plane using depth image
         if self.Tcam2robot is not None:
@@ -156,13 +161,17 @@ class TransNet_Pose_Estimator():
         if self._rgb_image is None or self._depth_image is None:
             rospy.loginfo('Not receive RGB-D image')
             return
-        if self.maskrcnn_output[0] is None:
-            rospy.loginfo('Not receive mask-rcnn output')
-            return
         with self._lock:
             output = {}
-            labels, scores, boxes, masks = self.maskrcnn_output
-            # print(labels.shape, scores.shape, boxes.shape, masks.shape)
+            with torch.no_grad():
+                self.list = self.maskrcnn_model([F.to_tensor(self._rgb_image).to('cuda')])[0]
+            category_idx = (self.list['labels'] == self.category[self.args.category])
+            boxes = self.list['boxes'][category_idx].cpu().numpy() #[N, 4]
+            labels = self.list['labels'][category_idx].cpu().numpy() #[N]
+            scores = self.list['scores'][category_idx].cpu().numpy() #[N]
+            masks = self.list['masks'][category_idx].cpu().numpy() #[N, 1, 480, 640]
+            self.maskrcnn_output = (labels, scores, boxes, masks)
+            rospy.loginfo(f'Detected {len(boxes)} objects as {self.args.category}')
             if len(masks) != len(boxes):
                 rospy.logwarn('mask and label-box-score not from the same image, skip inference') # TODO: add control
                 print(labels.shape, scores.shape, boxes.shape, masks.shape)
@@ -188,6 +197,7 @@ class TransNet_Pose_Estimator():
                 if score < self.args.score_threshold:
                     continue
                 if mask.sum() < self.args.pixelthreshold:
+                    rospy.loginfo(f'ignore obj {idx} with {mask.sum()} pixels < {self.args.pixelthreshold}')
                     continue        
                 transparent_mask[masks[0].squeeze() == 1] = 0
             
@@ -366,31 +376,56 @@ class TransNet_Pose_Estimator():
                 self.pose_pub.publish(pose_msg)
             if self.args.visualize_tag:
                 self.visualize()
-            # if self.args.savefile_tag:
-            #     self.savefile(None)
 
     def savefile(self, msg): # for user activation
         if self.output is None:
             return
+        torch.save(self.maskrcnn_output, self.args.savefile_path + f'maskrcnn_output.pt')
         torch.save(self.output, self.args.savefile_path + f'transnet_output.pt')
         if self.vis_img is not None:
-            cv2.imwrite(self.args.savefile_path + f'transnet_3Dbbox.png', self.vis_img)
+            cv2.imwrite(self.args.savefile_path + f'transnet_mask_pose_3Dbbox.png', self.vis_img)
         rospy.loginfo(f'result saved to transnet_output.pt')
     
     def visualize(self):
-        if self.output is None:
-            return
-        scale = self.output['scale']
-        pose = self.output['Trans']
-        print_msg = f'{len(scale)} obj pose estimates'
-        if self.Tcam2robot is not None:
-            print_msg += ', transformed to robot frame using calibration'
-        print(print_msg)
-        self.vis_img = deepcopy(self._rgb_image[:, :, ::-1])
-        for i in range(len(scale)):
-            self.vis_3dbbox(i, scale[i], pose[i])
-            self.vis_grasp_pose(pose[i])
+        with self._lock:
+            if self.output is None:
+                return
+            scale = self.output['scale']
+            pose = self.output['Trans']
+            print_msg = f'{len(scale)} obj pose estimates'
+            if self.Tcam2robot is not None:
+                print_msg += ', transformed to robot frame using calibration'
+            print(print_msg)
+            self.vis_img = deepcopy(self._rgb_image[:, :, ::-1])
+            self.vis_mask()
+            for i in range(len(scale)):
+                self.vis_3dbbox(i, scale[i], pose[i])
+                self.vis_grasp_pose(pose[i])
     
+    def vis_mask(self):
+        if self.maskrcnn_output is not None:
+            labels, scores, boxes, masks = self.maskrcnn_output
+            for idx in range(len(boxes)):
+                if labels[idx] <= 0:
+                    continue
+                x1, y1, x2, y2 = boxes[idx]
+                mask = masks[idx, 0]
+                color = np.asarray([255, 182, 193])
+                m = (mask > 0.5)
+                mask[m] = 1
+                mask = mask.astype('uint8')
+                mask = (mask > 0)
+                start_pt = tuple((int(x1), int(y1)))
+                end_pt = tuple((int(x2), int(y2)))
+                self.vis_img = cv2.rectangle(self.vis_img, start_pt, end_pt , (255,255,255), thickness=2)
+                self.vis_img[:, :][mask] = color
+                self.vis_img = np.ascontiguousarray(self.vis_img, dtype=np.uint8)
+                text_xy = [0, 0]
+                text_xy[0] = int(max((x1 + x2) / 2 - 18, 0))
+                text_xy[1] = int(max(y1 - 18, 0))
+                name = self.category_inverse[int(labels[idx])]
+                self.vis_img = cv2.putText(self.vis_img, name, (text_xy[0],text_xy[1]), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.6, thickness=2, color=(0,255,0))
+
     def vis_3dbbox(self, idx, scale, pose):
         x, y, z = scale[0] / 2, scale[1] / 2, scale[2] / 2
         p = []
@@ -438,8 +473,7 @@ class TransNet_Pose_Estimator():
         self.vis_img = cv2.circle(self.vis_img, (uv1[0], uv1[1]), 5, (255, 255, 255))
 
 
-def main(argv):
-    
+def main(argv): 
     args = flags.FLAGS
     node = TransNet_Pose_Estimator(args)
 
@@ -482,20 +516,24 @@ if __name__ == "__main__":
     flags.DEFINE_bool('savefile_tag', True, 'when set to true, will save all image and detected metadata to savefile_path')
     flags.DEFINE_string('savefile_path', 'data/output/', '')
     flags.DEFINE_bool('alwaysrun_tag', True, 'when set to true, will run in constant frequency --hz, otherwise will run once received activation signal from --user_activate_channel')
-    flags.DEFINE_float('hz', 0.5, '')
+    flags.DEFINE_float('hz', 1, '')
     flags.DEFINE_float('score_threshold', 0.5, '')
-    flags.DEFINE_string('category', 'water_cup', '')
+    flags.DEFINE_string('category', 'wine_cup', '')
     # flags.DEFINE_string('transnet_weight_path', 'src/transnet_ros/src/weight/water_cup_model_26.pth', 'check consistency with --category')
     flags.DEFINE_string('transnet_weight_path', 'src/transnet_ros/src/model/TransNet/wine_cup_new_model_29.pth', 'check consistency with --category')
     flags.DEFINE_string('rgb_channel', '/camera/color/image_raw', '')
     flags.DEFINE_string('depth_channel', '/camera/aligned_depth_to_color/image_raw', '')
     flags.DEFINE_string('caminfo_channel', '/camera/color/camera_info', '')
-    flags.DEFINE_string('input_meta_channel', '/maskrcnn_out_meta', 'check consistency with mask_rcnn_detector node')
-    flags.DEFINE_string('input_mask_channel', '/maskrcnn_out_mask', 'check consistency with mask_rcnn_detector node')
-    flags.DEFINE_string('cam2robot_calib_channel', '/cam2robot_transform', 'check consistency with camera_calibrator node')
+    # flags.DEFINE_string('input_meta_channel', '/maskrcnn_out_meta', 'check consistency with mask_rcnn_detector node')
+    # flags.DEFINE_string('input_mask_channel', '/maskrcnn_out_mask', 'check consistency with mask_rcnn_detector node')
+    # flags.DEFINE_string('cam2robot_calib_channel', '/cam2robot_transform', 'check consistency with camera_calibrator node')
     flags.DEFINE_string('output_vis_channel', '/transnet_vis', '')
     flags.DEFINE_string('output_pose_channel', '/transnet_out_pose', '')
     flags.DEFINE_string('user_activate_channel', '/transnet_activate', '')
     flags.DEFINE_string('user_save_channel', '/transnet_save', 'will update last saved estimation and keep publish it')
+
+    # move mask rcnn config together
+    flags.DEFINE_string('maskrcnn_weight_path', 'src/transnet_ros/src/model/MaskRCNN/mask_rcnn_2.pt', '')
+    
 
     app.run(main)
